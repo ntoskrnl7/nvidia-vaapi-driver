@@ -385,6 +385,9 @@ static tcuCtxSynchronize_local optionalCuCtxSynchronize;
 static CudaFunctions *cu;
 static CuvidFunctions *cv;
 static NvencFunctions *nv;
+// These function tables are copied into each NVDriver and read without the
+// loader mutex. Keep them alive for the lifetime of the shared object so a
+// concurrent VA teardown cannot invalidate another driver's pointers.
 static pthread_mutex_t global_codec_loader_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 extern const NVCodec __start_nvd_codecs[];
@@ -1435,41 +1438,6 @@ static bool recycleCudaContextAfterLastSession(NVDriver *drv, const char *reason
         "CUDA recycle after last session succeeded uses_primary=%d ctx=%p",
         drv->usesPrimaryCudaContext ? 1 : 0,
         drv->cudaContext
-    );
-    return true;
-}
-
-static bool reloadGlobalCodecFunctionsAfterLastSession(NVDriver *drv, const char *reason) {
-    if (drv == NULL) {
-        return false;
-    }
-
-    LOG(
-        "Reloading global codec function tables after last session reason=%s",
-        reason != NULL ? reason : "(null)"
-    );
-
-    resetProcessTransientState();
-    releaseGlobalCodecFunctions();
-    if (!ensureGlobalCodecFunctionsLoaded()) {
-        LOG(
-            "Global codec function reload failed after last session reason=%s",
-            reason != NULL ? reason : "(null)"
-        );
-        return false;
-    }
-
-    drv->cu = cu;
-    drv->cv = cv;
-    drv->nv = nv;
-    probeEncodeSupport(drv);
-
-    LOG(
-        "Reloaded global codec function tables after last session reason=%s cu=%p cv=%p nv=%p",
-        reason != NULL ? reason : "(null)",
-        drv->cu,
-        drv->cv,
-        drv->nv
     );
     return true;
 }
@@ -4111,22 +4079,13 @@ static bool destroyEncodeSession(NVContext *nvCtx) {
             if (nvEnableExperimentalDirectEncodeCudaArrayNv12() ||
                 nvEnableExperimentalDirectEncodeCudaPtrNv12()) {
                 LOG(
-                    "destroyEncodeSession context_id=%d skipping recycle/reload after last session while experimental direct NV12 path is enabled",
+                    "destroyEncodeSession context_id=%d skipping CUDA recycle after last session while experimental direct NV12 path is enabled",
                     (int) nvCtx->contextId
                 );
             } else {
                 LOG("destroyEncodeSession context_id=%d begin recycleCudaContextAfterLastSession", (int) nvCtx->contextId);
                 recycleCudaContextAfterLastSession(drv, "all_sessions_destroyed");
                 LOG("destroyEncodeSession context_id=%d done recycleCudaContextAfterLastSession", (int) nvCtx->contextId);
-                LOG(
-                    "destroyEncodeSession context_id=%d begin reloadGlobalCodecFunctionsAfterLastSession",
-                    (int) nvCtx->contextId
-                );
-                reloadGlobalCodecFunctionsAfterLastSession(drv, "all_sessions_destroyed");
-                LOG(
-                    "destroyEncodeSession context_id=%d done reloadGlobalCodecFunctionsAfterLastSession",
-                    (int) nvCtx->contextId
-                );
             }
             pthread_mutex_unlock(&drv->objectCreationMutex);
         }
@@ -9465,8 +9424,7 @@ static VAStatus nvTerminate( VADriverContextP ctx )
             );
         } else {
             resetProcessTransientState();
-            releaseGlobalCodecFunctions();
-            LOG("Released global CUDA/NVDEC/NVENC function tables after last instance shutdown");
+            LOG("Reset process transient state after last instance shutdown; retaining global codec function tables until library unload");
         }
     }
 
