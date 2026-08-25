@@ -8,6 +8,7 @@ This is a VA-API implementation that uses NVDEC for decode and includes experime
 - [Table of contents](#table-of-contents)
 - [Codec Support](#codec-support)
 - [Installation](#installation)
+  - [Quick install from this fork](#quick-install-from-this-fork)
   - [Packaging status](#packaging-status)
   - [Building](#building)
   - [Removal](#removal)
@@ -76,6 +77,24 @@ To install and use `nvidia-vaapi-driver`, follow the steps in installation and c
 
 - NVIDIA driver series 470 or 500+
 
+## Quick install from this fork
+
+This fork's `main` branch is intended to match the locally tested AoTofu driver build. If the repository is private, clone it with a GitHub account that has access:
+
+```sh
+git clone git@github.com:AoTofu/nvidia-vaapi-driver.git
+cd nvidia-vaapi-driver
+./install.sh --deps --clean
+```
+
+The installer builds the driver, backs up any existing `nvidia_drv_video.so`, installs the new driver into libva's driver directory, and runs a `vainfo` smoke test when possible. To skip dependency installation:
+
+```sh
+./install.sh --clean
+```
+
+The installer prints a rollback command if it replaced an existing driver.
+
 ## Packaging status
 
 <p align="top"><a href="https://repology.org/project/nvidia-vaapi-driver/versions"><img src="https://repology.org/badge/vertical-allrepos/nvidia-vaapi-driver.svg" alt="repology"><a href="https://repology.org/project/libva-nvidia-driver/versions"><img src="https://repology.org/badge/vertical-allrepos/libva-nvidia-driver.svg" alt="repology" align="top" width="%"></p>
@@ -141,6 +160,8 @@ Environment variables used to control the behavior of this library.
 | `NVD_DECODE_SURFACE_COUNT` | Override the default decode surface count used when clients create a decode context without render targets. Valid range is `1` to `32`; default is `32`. |
 | `NVD_ENABLE_CLIENT_PACKED_HEADERS` | Opt into prepending client-supplied H.264/HEVC packed header data. Default disabled because NVENC-generated SPS/PPS is safer for NVENC slice output. |
 | `NVD_DISABLE_CLIENT_PACKED_HEADERS` | Deprecated compatibility spelling. Client-supplied H.264/HEVC packed header data is ignored by default while packed-header capability advertisement remains enabled. |
+| `NVD_MAX_DETACHED_BACKING_IMAGE_BYTES` | Upper bound (in bytes) on the size of the detached backing-image cache used by the direct backend to recycle decode surfaces across stream switches. Lower this on low-VRAM GPUs to reduce memory usage at the cost of more re-allocation when streams change. Set to `0` to disable detached caching. Default: scales with the GPU — total VRAM / 64 (~1.6%), clamped to 64 MiB–512 MiB; falls back to `134217728` (128 MiB) if the VRAM size cannot be queried. |
+| `NVD_MAX_DETACHED_BACKING_IMAGES` | Upper bound on the number of cached detached backing images. Set to `0` to disable detached caching. Default: `16`. |
 
 ### `NVD_ENCODE_PROBE_CACHE`
 
@@ -247,6 +268,22 @@ For H.264-only encode testing, use the hotpatch project's
 `run-h264-vaapi.sh`. Use `vainfo` with the same `LIBVA_DRIVER_NAME` and
 `LIBVA_DRIVERS_PATH` environment to confirm the decode and encode entrypoints
 advertised by this driver on the target machine.
+
+The upstream Chromium-compatible single-buffer export path is also included.
+For Chrome / Chromium based browsers, set `LIBVA_DRIVER_NAME=nvidia` and start
+the browser with flags similar to:
+
+```sh
+LIBVA_DRIVER_NAME=nvidia google-chrome \
+  --enable-features=AcceleratedVideoDecodeLinuxGL,VaapiOnNvidiaGPUs \
+  --ignore-gpu-blocklist \
+  --use-gl=angle --use-angle=gl
+```
+
+On Wayland, also try `--ozone-platform=wayland` or
+`--ozone-platform-hint=auto`. Multi-plane YUV surfaces are exported as a
+single buffer with one DRM modifier, as required by Chromium's
+`vaapi_wrapper`.
 
 ## MPV
 

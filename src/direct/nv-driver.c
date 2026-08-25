@@ -32,6 +32,7 @@
 //Technically these can vary per architecture, but all the ones we support have the same values
 #define GOB_WIDTH_IN_BYTES  64
 #define GOB_HEIGHT_IN_BYTES 8
+#define SINGLE_BUFFER_PLANE_ALIGNMENT 65536
 
 static const NvHandle NULL_OBJECT;
 
@@ -570,48 +571,121 @@ bool alloc_memory(const NVDriverContext *context, const uint32_t size, int *fd) 
     return false;
 }
 
- bool alloc_image(NVDriverContext *context, uint32_t width, uint32_t height, uint8_t channels, uint8_t bitsPerChannel, uint32_t fourcc, NVDriverImage *image) {
-     uint32_t gobWidthInBytes = 64;
-     uint32_t gobHeightInBytes = 8;
+static uint32_t calculate_log2_gobs_per_block_y(const uint32_t height) {
+    uint32_t log2GobsPerBlockY = 4; // 16 gobs/block
 
-     uint32_t bytesPerChannel = bitsPerChannel/8;
-     uint32_t bytesPerPixel = channels * bytesPerChannel;
+    const uint64_t heightAndOneHalf = (uint64_t)height + ((uint64_t)height / 2ULL);
+    const uint64_t nvFermiBlockLinearGobHeight = GOB_HEIGHT_IN_BYTES;
 
-     //first figure out the gob layout
-     uint32_t log2GobsPerBlockX = 0; //TODO not sure if these are the correct numbers to start with, but they're the largest ones i've seen used
-     uint32_t log2GobsPerBlockY = height < 86 ? 3 : 4; //TODO 86 is a guess, 80px high needs 3, 112px needs 4, 96px needs 4, 88px needs 4, 86px needs 4
-     if (height < 43) log2GobsPerBlockY = 2;
-     if (height < 22) log2GobsPerBlockY = 1;
-     if (height < 11) log2GobsPerBlockY = 0;
-     uint32_t log2GobsPerBlockZ = 0;
-
-     //LOG("Calculated GOB size: %dx%d (%dx%d)", gobWidthInBytes << log2GobsPerBlockX, gobHeightInBytes << log2GobsPerBlockY, log2GobsPerBlockX, log2GobsPerBlockY);
-
-     //These two seem to be correct, but it was discovered by trial and error so I'm not 100% sure
-     uint32_t widthInBytes = ROUND_UP(width * bytesPerPixel, gobWidthInBytes << log2GobsPerBlockX);
-     uint32_t alignedHeight = ROUND_UP(height, gobHeightInBytes << log2GobsPerBlockY);
-
-     uint32_t imageSizeInBytes = widthInBytes * alignedHeight;
-     uint32_t size = imageSizeInBytes;
-
-     //this gets us some memory, and the fd to import into cuda
-    int memFd = -1;
-    int memFd2 = -1;
-    bool ret = alloc_memory(context, size, &memFd);
-    if (!ret) {
-        LOG("alloc_memory failed");
-        goto err;
+    // If we're wasting too much memory, cap the block height
+    while ((log2GobsPerBlockY > 0U) &&
+           (((nvFermiBlockLinearGobHeight * ((uint64_t)1ULL << log2GobsPerBlockY))) >
+            heightAndOneHalf)) {
+        log2GobsPerBlockY--;
     }
 
-     //now export the dma-buf
-     uint32_t pitchInBlocks = widthInBytes / (gobWidthInBytes << log2GobsPerBlockX);
+    // If there is more than one gob per block,
+    if (log2GobsPerBlockY > 0U) {
 
-     //printf("got gobsPerBlock: %ux%u %u %u %u %d\n", width, height, log2GobsPerBlockX, log2GobsPerBlockY, log2GobsPerBlockZ, pitchInBlocks);
-     //duplicate the fd so we don't invalidate it by importing it
-     memFd2 = dup(memFd);
+        // Proposed shrunk block size.
+        // compute a new proposedBlockSize, based on a gob size that is half
+        // of the current value (log2 - 1).  the "if(log2 > 0)" above keeps this
+        // value always ">= 0".
+        uint32_t proposedBlockSize =
+            GOB_HEIGHT_IN_BYTES << (log2GobsPerBlockY - 1U);
+
+        // While the proposedBlockSize is greater than the image size,
+        while (proposedBlockSize >= height) {
+            // It's safe to cut the gobs per block in half.
+            --log2GobsPerBlockY;
+
+            // If we've hit 1 gob per block, stop.
+            if (log2GobsPerBlockY == 0U) {
+                break;
+            }
+            // Otherwise, divide the proposed block dimension/size by two.
+            proposedBlockSize /= 2U;
+        }
+    }
+
+    return log2GobsPerBlockY;
+}
+
+uint32_t calculate_unified_image_layout(const NVDriverContext *context, NVDriverImage images[], const uint32_t width, const uint32_t height,
+                                        const uint32_t bppc, const uint32_t numPlanes, const NVFormatPlane planes[],
+                                        const bool unifyBlockHeight) {
+     const uint32_t log2GobsPerBlockX = 0;
+     const uint32_t log2GobsPerBlockZ = 0;
+
+     // Each plane's natural block height comes from its own (subsampled) height. How
+     // we use it depends on how the planes get exported:
+     //   - Packed into one shared buffer (single-buffer export): every plane must
+     //     advertise the same DRM modifier, so unify to the largest block height.
+     //     Over-aligning a short plane wastes a little memory but is harmless;
+     //     under-aligning would corrupt it.
+     //   - One dma-buf object per plane (multi-object export): each plane carries its
+     //     own modifier, so keep the exact per-plane value and match what the decoder
+     //     actually produces. A small chroma plane (e.g. a 168x96 video, whose chroma
+     //     is short enough to need a smaller block than luma) is tiled by NVDEC with
+     //     its own block height; forcing it to luma's larger block makes the importer
+     //     detile it wrong -> green chroma.
+     uint32_t perPlaneLog2Y[3] = { 0 };
+     for (uint32_t i = 0; i < numPlanes; i++) {
+         const uint32_t planeHeight = height >> planes[i].ss.y;
+         perPlaneLog2Y[i] = calculate_log2_gobs_per_block_y(planeHeight);
+     }
+
+     uint32_t unifiedLog2Y = perPlaneLog2Y[0];
+     for (uint32_t i = 1; i < numPlanes; i++) {
+         if (perPlaneLog2Y[i] > unifiedLog2Y) {
+             unifiedLog2Y = perPlaneLog2Y[i];
+         }
+     }
+
+     uint32_t offset = 0;
+     for (uint32_t i = 0; i < numPlanes; i++) {
+         const uint32_t log2GobsPerBlockY = unifyBlockHeight ? unifiedLog2Y : perPlaneLog2Y[i];
+         const uint32_t planeWidth = width >> planes[i].ss.x;
+         const uint32_t planeHeight = height >> planes[i].ss.y;
+         const uint32_t bytesPerPixel = planes[i].channelCount * bppc;
+
+         const uint32_t widthInBytes = ROUND_UP(planeWidth * bytesPerPixel, GOB_WIDTH_IN_BYTES << log2GobsPerBlockX);
+         const uint32_t alignedHeight = ROUND_UP(planeHeight, GOB_HEIGHT_IN_BYTES << log2GobsPerBlockY);
+
+         images[i].width = planeWidth;
+         images[i].height = planeHeight;
+         images[i].offset = offset;
+         images[i].memorySize = widthInBytes * alignedHeight;
+         images[i].pitch = widthInBytes;
+         images[i].mods = DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, context->sector_layout, context->page_kind_generation, context->generic_page_kind, log2GobsPerBlockY);
+         images[i].fourcc = planes[i].fourcc;
+         images[i].log2GobsPerBlockX = log2GobsPerBlockX;
+         images[i].log2GobsPerBlockY = log2GobsPerBlockY;
+         images[i].log2GobsPerBlockZ = log2GobsPerBlockZ;
+
+         LOG_DEBUG("Unified layout plane %u: %ux%u offset=%u pitch=%u size=%u log2GobsPerBlockY=%u",
+                   i, images[i].width, images[i].height, images[i].offset, images[i].pitch, images[i].memorySize, log2GobsPerBlockY);
+
+         offset += images[i].memorySize;
+         offset = ROUND_UP(offset, SINGLE_BUFFER_PLANE_ALIGNMENT);
+     }
+
+     return offset;
+}
+
+// Imports an already-allocated block-linear buffer (memFd) into NVKMS and exports
+// it as a PRIME dma-buf. On success a kept-alive dup of memFd is returned in *nvFd2
+// (needed for the later CUDA import) along with the exported dma-buf in *drmFd; the
+// caller retains ownership of memFd. On failure every fd allocated here is released
+// and memFd is left untouched for the caller to close.
+static bool import_and_export_buffer(const NVDriverContext *context, const int memFd, const uint32_t importSize,
+                                     const uint32_t pitchInBlocks, const uint32_t log2GobsPerBlockX,
+                                     const uint32_t log2GobsPerBlockY, const uint32_t log2GobsPerBlockZ,
+                                     int *nvFd2, int *drmFd) {
+     int memFd2 = dup(memFd);
      if (memFd2 == -1) {
          LOG("dup failed");
-         goto err;
+         return false;
      }
 
      struct NvKmsKapiPrivImportMemoryParams nvkmsParams = {
@@ -628,28 +702,26 @@ bool alloc_memory(const NVDriverContext *context, const uint32_t size, int *fd) 
          }
      };
 
-     //TODO find the proper page size
-     imageSizeInBytes = ROUND_UP(imageSizeInBytes, 65536);
-
      struct drm_nvidia_gem_import_nvkms_memory_params params = {
-         .mem_size = imageSizeInBytes,
+         .mem_size = importSize,
          .nvkms_params_ptr = (uint64_t)(uintptr_t)&nvkmsParams,
          .nvkms_params_size = context->driverMajorVersion == 470 ? 0x20 : sizeof(nvkmsParams) //needs to be 0x20 in the 470 series driver
      };
+
      int drmret = ioctl(context->drmFd, DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY, &params);
      if (drmret != 0) {
          LOG("DRM_IOCTL_NVIDIA_GEM_IMPORT_NVKMS_MEMORY failed: %d %d", drmret, errno);
          goto err;
      }
 
-     //export dma-buf
      struct drm_prime_handle prime_handle = {
-         .handle = params.handle
+         .handle = params.handle,
+         .fd = -1
      };
      drmret = ioctl(context->drmFd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime_handle);
      if (drmret != 0) {
          LOG("DRM_IOCTL_PRIME_HANDLE_TO_FD failed: %d %d", drmret, errno);
-         goto err;
+         goto gem_err;
      }
 
      struct drm_gem_close gem_close = {
@@ -661,33 +733,119 @@ bool alloc_memory(const NVDriverContext *context, const uint32_t size, int *fd) 
          goto prime_err;
      }
 
+     *nvFd2 = memFd2;
+     *drmFd = prime_handle.fd;
+     return true;
+
+prime_err:
+     if (prime_handle.fd >= 0) {
+         close(prime_handle.fd);
+     }
+
+gem_err:
+     {
+         struct drm_gem_close gem_close = {
+             .handle = params.handle
+         };
+         drmret = ioctl(context->drmFd, DRM_IOCTL_GEM_CLOSE, &gem_close);
+         if (drmret != 0) {
+             LOG("DRM_IOCTL_GEM_CLOSE cleanup failed: %d %d", drmret, errno);
+         }
+     }
+
+err:
+     if (memFd2 >= 0) {
+         close(memFd2);
+     }
+
+     return false;
+}
+
+bool alloc_buffer(NVDriverContext *context, const uint32_t totalSize, const NVDriverImage images[], int *nvFd, int *nvFd2, int *drmFd) {
+     int memFd = -1;
+     bool ret = alloc_memory(context, totalSize, &memFd);
+     if (!ret) {
+         LOG("alloc_memory failed");
+         return false;
+     }
+
+     const uint32_t pitchInBlocks = images[0].pitch / (GOB_WIDTH_IN_BYTES << images[0].log2GobsPerBlockX);
+     const uint32_t imageSizeInBytes = ROUND_UP(totalSize, 65536);
+
+     LOG_DEBUG("alloc_buffer: totalSize=%u importSize=%u pitchInBlocks=%u log2GobsPerBlockY=%u",
+               totalSize, imageSizeInBytes, pitchInBlocks, images[0].log2GobsPerBlockY);
+
+     int memFd2 = -1, primeFd = -1;
+     if (!import_and_export_buffer(context, memFd, imageSizeInBytes, pitchInBlocks,
+                                   images[0].log2GobsPerBlockX, images[0].log2GobsPerBlockY,
+                                   images[0].log2GobsPerBlockZ, &memFd2, &primeFd)) {
+         close(memFd);
+         return false;
+     }
+
+     *nvFd = memFd;
+     *nvFd2 = memFd2;
+     *drmFd = primeFd;
+     return true;
+}
+
+ bool alloc_image(NVDriverContext *context, uint32_t width, uint32_t height, uint8_t channels, uint8_t bitsPerChannel, uint32_t fourcc, NVDriverImage *image) {
+     uint32_t gobWidthInBytes = 64;
+     uint32_t gobHeightInBytes = 8;
+
+     uint32_t bytesPerChannel = bitsPerChannel/8;
+     uint32_t bytesPerPixel = channels * bytesPerChannel;
+
+     //first figure out the gob layout
+     uint32_t log2GobsPerBlockX = 0; //TODO not sure if these are the correct numbers to start with, but they're the largest ones i've seen used
+     uint32_t log2GobsPerBlockY = calculate_log2_gobs_per_block_y(height);
+     uint32_t log2GobsPerBlockZ = 0;
+
+     //LOG("Calculated GOB size: %dx%d (%dx%d)", gobWidthInBytes << log2GobsPerBlockX, gobHeightInBytes << log2GobsPerBlockY, log2GobsPerBlockX, log2GobsPerBlockY);
+
+     //These two seem to be correct, but it was discovered by trial and error so I'm not 100% sure
+     uint32_t widthInBytes = ROUND_UP(width * bytesPerPixel, gobWidthInBytes << log2GobsPerBlockX);
+     uint32_t alignedHeight = ROUND_UP(height, gobHeightInBytes << log2GobsPerBlockY);
+
+     uint32_t imageSizeInBytes = widthInBytes * alignedHeight;
+     uint32_t size = imageSizeInBytes;
+
+    //this gets us some memory, and the fd to import into cuda
+    int memFd = -1;
+    bool ret = alloc_memory(context, size, &memFd);
+    if (!ret) {
+        LOG("alloc_memory failed");
+        return false;
+    }
+
+     //now export the dma-buf
+     uint32_t pitchInBlocks = widthInBytes / gobWidthInBytes;
+
+     //TODO find the proper page size
+     imageSizeInBytes = ROUND_UP(imageSizeInBytes, 65536);
+
+     int memFd2 = -1, primeFd = -1;
+     if (!import_and_export_buffer(context, memFd, imageSizeInBytes, pitchInBlocks,
+                                   log2GobsPerBlockX, log2GobsPerBlockY, log2GobsPerBlockZ,
+                                   &memFd2, &primeFd)) {
+         close(memFd);
+         return false;
+     }
+
      image->width = width;
      image->height = height;
      image->nvFd = memFd;
      image->nvFd2 = memFd2; //not sure why we can't close this one, we shouldn't need it after importing the image
-     image->drmFd = prime_handle.fd;
+     image->drmFd = primeFd;
      image->useDmaBufHandle = false;
      image->mods = DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, context->sector_layout, context->page_kind_generation, context->generic_page_kind, log2GobsPerBlockY);
      image->offset = 0;
      image->pitch = widthInBytes;
      image->memorySize = imageSizeInBytes;
      image->fourcc = fourcc;
+     image->log2GobsPerBlockX = log2GobsPerBlockX;
+     image->log2GobsPerBlockY = log2GobsPerBlockY;
+     image->log2GobsPerBlockZ = log2GobsPerBlockZ;
 
      return true;
-
- prime_err:
-     if (prime_handle.fd > 0) {
-         backendCloseFd(prime_handle.fd, "alloc_image_fail_prime_fd");
-     }
-
- err:
-     if (memFd2 > 0) {
-         backendCloseFd(memFd2, "alloc_image_fail_memfd2");
-     }
-     if (memFd > 0) {
-         backendCloseFd(memFd, "alloc_image_fail_memfd");
-     }
-
-     return false;
- }
-
+}

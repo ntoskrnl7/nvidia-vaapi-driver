@@ -2,14 +2,15 @@
 
 #include "../vabackend.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <ffnvcodec/dynlink_loader.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
-#include <sys/mman.h>
 #ifdef __linux__
 #include <sys/sysmacros.h>
 #endif
@@ -267,6 +268,108 @@ static void directInitBackingImage(BackingImage *img, bool importedGpuCopy) {
     }
 
     img->importedGpuCopy = importedGpuCopy;
+    pthread_mutex_init(&img->mutex, NULL);
+    pthread_cond_init(&img->cond, NULL);
+    img->syncInitialized = true;
+}
+
+static void cacheBackingImageFdStat(BackingImage *img, int index) {
+    if (img == NULL || index < 0 || index >= 4 || img->fds[index] < 0) {
+        return;
+    }
+
+    struct stat s;
+    if (fstat(img->fds[index], &s) == 0) {
+        img->st_dev[index] = s.st_dev;
+        img->st_ino[index] = s.st_ino;
+    }
+}
+
+static uint64_t backingImageMemorySize(const BackingImage *img) {
+    if (img == NULL) {
+        return 0;
+    }
+    if (img->totalSize != 0) {
+        return img->totalSize;
+    }
+
+    const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
+    uint64_t size = 0;
+    for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+        size += img->size[i];
+    }
+    return size;
+}
+
+static bool backingImageCanPrune(const BackingImage *img) {
+    return img != NULL &&
+           img->surface == NULL &&
+           atomic_load(&img->borrowCount) == 0;
+}
+
+static bool detachedBackingImagesOverLimit(uint64_t bytes, uint32_t count, const NVDriver *drv) {
+    if (count == 0) {
+        return false;
+    }
+    if (drv->maxDetachedBackingImages == 0 || drv->maxDetachedBackingImageBytes == 0) {
+        return true;
+    }
+    return count > drv->maxDetachedBackingImages ||
+           bytes > drv->maxDetachedBackingImageBytes;
+}
+
+static bool pruneOldestDetachedBackingImageLocked(NVDriver *drv, uint64_t *bytes, uint32_t *count) {
+    uint32_t pruneIndex = UINT32_MAX;
+    uint64_t oldestSerial = UINT64_MAX;
+
+    ARRAY_FOR_EACH(BackingImage*, img, &drv->images)
+        if (backingImageCanPrune(img) && img->detachedSerial < oldestSerial) {
+            pruneIndex = img_idx;
+            oldestSerial = img->detachedSerial;
+        }
+    END_FOR_EACH
+
+    if (pruneIndex == UINT32_MAX) {
+        return false;
+    }
+
+    BackingImage *img = get_element_at(&drv->images, pruneIndex);
+    const uint64_t imageBytes = backingImageMemorySize(img);
+    destroyBackingImage(drv, img);
+    remove_element_at(&drv->images, pruneIndex);
+    *bytes = *bytes >= imageBytes ? *bytes - imageBytes : 0;
+    if (*count > 0) {
+        (*count)--;
+    }
+    return true;
+}
+
+static void pruneDetachedBackingImagesToLimits(NVDriver *drv) {
+    uint64_t bytes = 0;
+    uint32_t count = 0;
+
+    pthread_mutex_lock(&drv->imagesMutex);
+    ARRAY_FOR_EACH(BackingImage*, img, &drv->images)
+        if (backingImageCanPrune(img)) {
+            bytes += backingImageMemorySize(img);
+            count++;
+        }
+    END_FOR_EACH
+
+    while (detachedBackingImagesOverLimit(bytes, count, drv) &&
+           pruneOldestDetachedBackingImageLocked(drv, &bytes, &count)) {
+    }
+    pthread_mutex_unlock(&drv->imagesMutex);
+}
+
+static bool pruneOldestReclaimableDetachedBackingImage(NVDriver *drv) {
+    uint64_t bytes = 0;
+    uint32_t count = 0;
+
+    pthread_mutex_lock(&drv->imagesMutex);
+    const bool pruned = pruneOldestDetachedBackingImageLocked(drv, &bytes, &count);
+    pthread_mutex_unlock(&drv->imagesMutex);
+    return pruned;
 }
 
 static void directInitCudaImage(NVCudaImage *cudaImage, int importedFd) {
@@ -1126,7 +1229,7 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
     backingImage->width = surface->width;
     backingImage->height = surface->height;
 
-    LOG("Allocating BackingImages: %p %dx%d", backingImage, surface->width, surface->height);
+    LOG_DEBUG("Allocating BackingImages: %p %dx%d", backingImage, surface->width, surface->height);
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         if (!alloc_image(&drv->driverContext,
                          surface->width >> p[i].ss.x,
@@ -1145,6 +1248,7 @@ static BackingImage *direct_allocateBackingImage(NVDriver *drv, NVSurface *surfa
 
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         backingImage->fds[i] = driverImages[i].drmFd;
+        cacheBackingImageFdStat(backingImage, (int) i);
         backingImage->strides[i] = driverImages[i].pitch;
         backingImage->mods[i] = driverImages[i].mods;
         backingImage->size[i] = driverImages[i].memorySize;
@@ -1457,35 +1561,57 @@ static void destroyBackingImage(NVDriver *drv, BackingImage *img) {
     if (img->surface != NULL) {
         img->surface->backingImage = NULL;
     }
+    if (img->borrowedBackingImage != NULL && atomic_load(&img->borrowedBackingImage->borrowCount) > 0) {
+        atomic_fetch_sub(&img->borrowedBackingImage->borrowCount, 1);
+        img->borrowedBackingImage = NULL;
+    }
+
+    if (img->externalMapping != NULL) {
+        munmap(img->externalMapping, img->externalMappingSize);
+        img->externalMapping = NULL;
+        img->externalMappingSize = 0;
+    }
+    if (img->externalDevicePtr != 0) {
+        CHECK_CUDA_RESULT(drv->cu->cuMemFree(img->externalDevicePtr));
+        img->externalDevicePtr = 0;
+        img->externalDeviceSize = 0;
+    }
 
     directReleaseWholeFrameNv12CudaArray(drv, img, "destroyBackingImage");
 
-    for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        if (img->arrays[i] != NULL) {
-            CHECK_CUDA_RESULT(drv->cu->cuArrayDestroy(img->arrays[i]));
-        }
-        img->cudaImages[i].mappedBuffer = 0;
-        img->cudaImages[i].mappedBufferSize = 0;
+    if (!img->borrowedCudaResources) {
+        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+            if (img->arrays[i] != NULL) {
+                CHECK_CUDA_RESULT(drv->cu->cuArrayDestroy(img->arrays[i]));
+            }
 
-        if (img->cudaImages[i].mipmapArray != NULL) {
-            CHECK_CUDA_RESULT(drv->cu->cuMipmappedArrayDestroy(img->cudaImages[i].mipmapArray));
-        }
+            img->cudaImages[i].mappedBuffer = 0;
+            img->cudaImages[i].mappedBufferSize = 0;
+            if (img->cudaImages[i].mipmapArray != NULL) {
+                CHECK_CUDA_RESULT(drv->cu->cuMipmappedArrayDestroy(img->cudaImages[i].mipmapArray));
+            }
 
-        if (img->cudaImages[i].extMem != NULL) {
-            bool alreadyDestroyed = false;
-            for (uint32_t j = 0; j < i; j++) {
-                if (img->cudaImages[j].extMem == img->cudaImages[i].extMem) {
-                    alreadyDestroyed = true;
-                    break;
+            if (img->cudaImages[i].extMem != NULL) {
+                bool alreadyDestroyed = false;
+                for (uint32_t j = 0; j < i; j++) {
+                    if (img->cudaImages[j].extMem == img->cudaImages[i].extMem) {
+                        alreadyDestroyed = true;
+                        break;
+                    }
+                }
+                if (!alreadyDestroyed) {
+                    CUresult destroyResult = drv->cu->cuDestroyExternalMemory(img->cudaImages[i].extMem);
+                    CHECK_CUDA_RESULT(destroyResult);
+                    directReleaseCudaImportedFd(&img->cudaImages[i], "destroyBackingImage");
+                } else {
+                    img->cudaImages[i].importedFd = -1;
                 }
             }
-            if (!alreadyDestroyed) {
-                CUresult destroyResult = drv->cu->cuDestroyExternalMemory(img->cudaImages[i].extMem);
-                CHECK_CUDA_RESULT(destroyResult);
-                directReleaseCudaImportedFd(&img->cudaImages[i], "destroyBackingImage");
-            } else {
-                img->cudaImages[i].importedFd = -1;
-            }
+        }
+
+        if (img->extMem != NULL) {
+            CHECK_CUDA_RESULT(drv->cu->cuDestroyExternalMemory(img->extMem));
+            img->extMem = NULL;
         }
     }
 
@@ -1496,6 +1622,11 @@ static void destroyBackingImage(NVDriver *drv, BackingImage *img) {
             backendCloseFd(img->fds[i], "direct_destroy_backing_fd");
             img->fds[i] = -1;
         }
+    }
+
+    if (img->syncInitialized) {
+        pthread_cond_destroy(&img->cond);
+        pthread_mutex_destroy(&img->mutex);
     }
 
     memset(img, 0, sizeof(BackingImage));
@@ -1616,8 +1747,23 @@ static bool directRestoreBackingCudaViews(NVDriver *drv, BackingImage *img, cons
 }
 
 static void direct_attachBackingImageToSurface(NVDriver *drv, NVSurface *surface, BackingImage *img) {
+    bool tracked = false;
+    pthread_mutex_lock(&drv->imagesMutex);
+    ARRAY_FOR_EACH(BackingImage*, existing, &drv->images)
+        if (existing == img) {
+            tracked = true;
+            break;
+        }
+    END_FOR_EACH
+    if (!tracked) {
+        add_element(&drv->images, img);
+    }
+    img->detachedSerial = 0;
+    pthread_mutex_unlock(&drv->imagesMutex);
+
     surface->backingImage = img;
     img->surface = surface;
+    nvBackingImageStoreSurfaceColorMetadata(img, surface);
     directLogBackingImageSummary("attach_surface", img);
 }
 
@@ -1627,10 +1773,28 @@ static void direct_detachBackingImageFromSurface(NVDriver *drv, NVSurface *surfa
     }
 
     BackingImage *img = surface->backingImage;
-    img->surface = NULL;
-    surface->backingImage = NULL;
+    if (img->isExternalBuffer || img->borrowedCudaResources) {
+        pthread_mutex_lock(&drv->imagesMutex);
+        ARRAY_FOR_EACH(BackingImage*, existing, &drv->images)
+            if (existing == img) {
+                remove_element_at(&drv->images, existing_idx);
+                break;
+            }
+        END_FOR_EACH
+        pthread_mutex_unlock(&drv->imagesMutex);
 
-    destroyBackingImage(drv, img);
+        destroyBackingImage(drv, img);
+        surface->backingImage = NULL;
+        return;
+    }
+
+    pthread_mutex_lock(&drv->imagesMutex);
+    img->surface = NULL;
+    img->detachedSerial = ++drv->detachedBackingImageSerial;
+    surface->backingImage = NULL;
+    pthread_mutex_unlock(&drv->imagesMutex);
+
+    pruneDetachedBackingImagesToLimits(drv);
 }
 
 static void direct_destroyAllBackingImage(NVDriver *drv) {
@@ -1854,8 +2018,52 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
     const NVFormatInfo *fmtInfo = &formatsInfo[surface->backingImage->format];
     uint32_t y = 0;
 
+    // For the host-mapped external surface fallback we stage each plane through
+    // a host buffer. Plane 0 (luma) is always the largest, so allocate one
+    // buffer sized to it up front and reuse it for every plane instead of
+    // malloc/free per plane on every resolved frame.
+    uint8_t *stagingPlane = NULL;
+    if (surface->backingImage->externalMapping != NULL) {
+        const uint32_t stagingBytes = surface->width * fmtInfo->bppc * fmtInfo->plane[0].channelCount * surface->height;
+        stagingPlane = malloc(stagingBytes);
+        if (stagingPlane == NULL) {
+            return false;
+        }
+    }
+
     for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
         const NVFormatPlane *p = &fmtInfo->plane[i];
+        const uint32_t widthInBytes = (surface->width >> p->ss.x) * fmtInfo->bppc * p->channelCount;
+        const uint32_t height = surface->height >> p->ss.y;
+        if (surface->backingImage->externalMapping != NULL) {
+            CUDA_MEMCPY2D cpy = {
+                .srcMemoryType = CU_MEMORYTYPE_DEVICE,
+                .srcDevice = ptr,
+                .srcY = y,
+                .srcPitch = pitch,
+                .dstMemoryType = CU_MEMORYTYPE_HOST,
+                .dstHost = stagingPlane,
+                .dstPitch = widthInBytes,
+                .Height = height,
+                .WidthInBytes = widthInBytes
+            };
+            bool failed = CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy));
+            if (!failed) {
+                uint8_t *dst = (uint8_t*) surface->backingImage->externalMapping + surface->backingImage->offsets[i];
+                for (uint32_t row = 0; row < height; row++) {
+                    memcpy(dst + (size_t) row * surface->backingImage->strides[i],
+                           stagingPlane + (size_t) row * widthInBytes,
+                           widthInBytes);
+                }
+            }
+            if (failed) {
+                free(stagingPlane);
+                return false;
+            }
+            y += height;
+            continue;
+        }
+
         CUDA_MEMCPY2D cpy = {
             .srcMemoryType = CU_MEMORYTYPE_DEVICE,
             .srcDevice = ptr,
@@ -1863,21 +2071,23 @@ static bool copyFrameToSurface(NVDriver *drv, CUdeviceptr ptr, NVSurface *surfac
             .srcPitch = pitch,
             .dstMemoryType = CU_MEMORYTYPE_ARRAY,
             .dstArray = surface->backingImage->arrays[i],
-            .Height = surface->height >> p->ss.y,
-            .WidthInBytes = (surface->width >> p->ss.x) * fmtInfo->bppc * p->channelCount
+            .Height = height,
+            .WidthInBytes = widthInBytes
         };
         if (i == fmtInfo->numPlanes - 1) {
             CHECK_CUDA_RESULT(drv->cu->cuMemcpy2D(&cpy));
         } else {
             CHECK_CUDA_RESULT(drv->cu->cuMemcpy2DAsync(&cpy, 0));
         }
-        y += surface->height >> p->ss.y;
+        y += height;
     }
+
+    free(stagingPlane);
 
     //notify anyone waiting for us to be resolved
     pthread_mutex_lock(&surface->mutex);
     surface->resolving = 0;
-    pthread_cond_signal(&surface->cond);
+    pthread_cond_broadcast(&surface->cond);
     pthread_mutex_unlock(&surface->mutex);
 
     return true;
@@ -1891,9 +2101,28 @@ static bool direct_realiseSurface(NVDriver *drv, NVSurface *surface) {
         //try to find a free surface
         BackingImage *img = direct_allocateBackingImage(drv, surface, false);
         if (img == NULL) {
-            LOG("Unable to realise surface: %p (%d)", surface, surface->pictureIdx)
-            pthread_mutex_unlock(&surface->mutex);
-            return false;
+            // Allocation failed, typically under VRAM pressure. Reclaim detached
+            // backing images oldest-first, retrying the allocation after each
+            // one, instead of destroying the whole detached cache at once. The
+            // most-recently-detached images are the most likely to still have
+            // their exported dma-buf in flight in the client (or about to be
+            // re-imported across a codec/format switch); freeing those out from
+            // under the client corrupts the displayed frame. Oldest-first with a
+            // retry between each prune frees only what this allocation needs and
+            // keeps the recent frames alive.
+            uint32_t reclaimed = 0;
+            while (img == NULL && pruneOldestReclaimableDetachedBackingImage(drv)) {
+                reclaimed++;
+                img = direct_allocateBackingImage(drv, surface, false);
+            }
+            if (reclaimed > 0 && img != NULL) {
+                LOG("Reclaimed %u detached BackingImage(s) oldest-first after allocation failure", reclaimed)
+            }
+            if (img == NULL) {
+                LOG("Unable to realise surface: %p (%d)", surface, surface->pictureIdx)
+                pthread_mutex_unlock(&surface->mutex);
+                return false;
+            }
         }
 
         direct_attachBackingImageToSurface(drv, surface, img);
@@ -1910,13 +2139,50 @@ static bool direct_realiseSurface(NVDriver *drv, NVSurface *surface) {
     return true;
 }
 
+static BackingImage *resolveSyncImage(BackingImage *img) {
+    if (img != NULL && img->borrowedBackingImage != NULL) {
+        return img->borrowedBackingImage;
+    }
+    return img;
+}
+
+static void finishSurfaceResolve(NVSurface *surface) {
+    pthread_mutex_lock(&surface->mutex);
+    surface->resolving = 0;
+    pthread_cond_broadcast(&surface->cond);
+    pthread_mutex_unlock(&surface->mutex);
+}
+
 static bool direct_exportCudaPtr(NVDriver *drv, CUdeviceptr ptr, NVSurface *surface, uint32_t pitch) {
     if (!direct_realiseSurface(drv, surface)) {
+        finishSurfaceResolve(surface);
         return false;
     }
 
     if (ptr != 0) {
-        copyFrameToSurface(drv, ptr, surface, pitch);
+        BackingImage *img = surface->backingImage;
+        BackingImage *syncImg = resolveSyncImage(img);
+        if (syncImg != NULL && syncImg->syncInitialized) {
+            pthread_mutex_lock(&syncImg->mutex);
+            syncImg->resolving = true;
+            pthread_mutex_unlock(&syncImg->mutex);
+        }
+        nvStatsIncrement(drv, NV_STAT_EXPORT_COPIES);
+        if (img != NULL && img->externalMapping != NULL) {
+            nvStatsIncrement(drv, NV_STAT_EXPORT_HOST_COPIES);
+        }
+        nvBackingImageStoreSurfaceColorMetadata(img, surface);
+        bool copied = copyFrameToSurface(drv, ptr, surface, pitch);
+        if (syncImg != NULL && syncImg->syncInitialized) {
+            pthread_mutex_lock(&syncImg->mutex);
+            syncImg->resolving = false;
+            pthread_cond_broadcast(&syncImg->cond);
+            pthread_mutex_unlock(&syncImg->mutex);
+        }
+        if (!copied) {
+            finishSurfaceResolve(surface);
+            return false;
+        }
     } else {
         LOG("exporting with null ptr")
     }
@@ -2655,6 +2921,7 @@ static bool direct_importExternalSurfaceImpl(NVDriver *drv, NVSurface *surface, 
         return false;
     }
     directInitBackingImage(backingImage, false);
+    backingImage->isExternalBuffer = true;
     directNoteBackingCreate(backingImage);
     direct_initBackingImageFds(backingImage);
     backingImage->format = importFormat;
@@ -3055,9 +3322,10 @@ static bool direct_importExternalSurface(NVDriver *drv, NVSurface *surface, cons
 }
 
 static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRMPRIMESurfaceDescriptor *desc) {
-    (void)drv;
     const BackingImage *img = surface->backingImage;
     const NVFormatInfo *fmtInfo = &formatsInfo[img->format];
+
+    nvBackingImageStoreSurfaceColorMetadata(surface->backingImage, surface);
 
     // VADRMPRIMESurfaceDescriptor::fourcc must be VA_FOURCC_*.
     // Per-layer DRM formats are provided in layers[].drm_format.
@@ -3066,66 +3334,78 @@ static bool direct_fillExportDescriptor(NVDriver *drv, NVSurface *surface, VADRM
     desc->height = surface->height;
 
     desc->num_layers = fmtInfo->numPlanes;
-    desc->num_objects = fmtInfo->numPlanes;
-
-    int exportedFds[ARRAY_SIZE(desc->objects)];
-    for (uint32_t i = 0; i < ARRAY_SIZE(exportedFds); i++) {
-        exportedFds[i] = -1;
+    for (uint32_t i = 0; i < ARRAY_SIZE(desc->objects); i++) {
         desc->objects[i].fd = -1;
     }
 
-    uint32_t exportedObjects = 0;
-    for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
-        const NVFormatPlane *plane = &fmtInfo->plane[i];
-        const uint32_t planeHeight = img->height >> plane->ss.y;
-        const uint64_t minPlaneSize =
-            (uint64_t)img->offsets[i] + ((uint64_t)img->strides[i] * planeHeight);
-        uint64_t objectSize = img->size[i];
-        if (objectSize < minPlaneSize) {
-            objectSize = minPlaneSize;
-        }
-        if (objectSize > UINT32_MAX) {
-            objectSize = UINT32_MAX;
-        }
-
-        if (img->fds[i] < 0) {
-            LOG("cannot export plane=%u: invalid source fd=%d", i, img->fds[i]);
+    nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS);
+    if (img->isSingleBuffer) {
+        nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS_SINGLE);
+        if (img->fds[0] < 0) {
+            LOG("cannot export single-buffer surface: invalid source fd=%d", img->fds[0]);
             goto fail;
         }
-        const int exportedFd = dup(img->fds[i]);
-        if (exportedFd < 0) {
-            LOG(
-                "failed to duplicate export fd plane=%u src_fd=%d errno=%d",
-                i,
-                img->fds[i],
-                errno
-            );
+
+        desc->num_objects = 1;
+        desc->objects[0].fd = dup(img->fds[0]);
+        if (desc->objects[0].fd < 0) {
+            LOG("failed to duplicate single-buffer export fd=%d errno=%d", img->fds[0], errno);
             goto fail;
         }
-        exportedFds[i] = exportedFd;
-        desc->objects[i].size = (uint32_t)objectSize;
-        desc->objects[i].drm_format_modifier = img->mods[i];
-        exportedObjects++;
+        desc->objects[0].size = img->totalSize;
+        desc->objects[0].drm_format_modifier = img->mods[0];
 
-        desc->layers[i].drm_format = fmtInfo->plane[i].fourcc;
-        desc->layers[i].num_planes = 1;
-        desc->layers[i].object_index[0] = i;
-        desc->layers[i].offset[0] = img->offsets[i];
-        desc->layers[i].pitch[0] = img->strides[i];
-    }
+        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+            desc->layers[i].drm_format = fmtInfo->plane[i].fourcc;
+            desc->layers[i].num_planes = 1;
+            desc->layers[i].object_index[0] = 0;
+            desc->layers[i].offset[0] = img->offsets[i];
+            desc->layers[i].pitch[0] = img->strides[i];
+        }
+    } else {
+        nvStatsIncrement(drv, NV_STAT_EXPORT_DESCRIPTORS_MULTI);
+        desc->num_objects = fmtInfo->numPlanes;
 
-    for (uint32_t i = 0; i < exportedObjects; i++) {
-        desc->objects[i].fd = exportedFds[i];
-        exportedFds[i] = -1;
+        for (uint32_t i = 0; i < fmtInfo->numPlanes; i++) {
+            const NVFormatPlane *plane = &fmtInfo->plane[i];
+            const uint32_t planeHeight = img->height >> plane->ss.y;
+            const uint64_t minPlaneSize =
+                (uint64_t)img->offsets[i] + ((uint64_t)img->strides[i] * planeHeight);
+            uint64_t objectSize = img->size[i];
+            if (objectSize < minPlaneSize) {
+                objectSize = minPlaneSize;
+            }
+            if (objectSize > UINT32_MAX) {
+                objectSize = UINT32_MAX;
+            }
+
+            if (img->fds[i] < 0) {
+                LOG("cannot export plane=%u: invalid source fd=%d", i, img->fds[i]);
+                goto fail;
+            }
+            desc->objects[i].fd = dup(img->fds[i]);
+            if (desc->objects[i].fd < 0) {
+                LOG("failed to duplicate export fd plane=%u src_fd=%d errno=%d", i, img->fds[i], errno);
+                goto fail;
+            }
+            desc->objects[i].size = (uint32_t)objectSize;
+            desc->objects[i].drm_format_modifier = img->mods[i];
+
+            desc->layers[i].drm_format = plane->fourcc;
+            desc->layers[i].num_planes = 1;
+            desc->layers[i].object_index[0] = i;
+            desc->layers[i].offset[0] = img->offsets[i];
+            desc->layers[i].pitch[0] = img->strides[i];
+        }
     }
 
     return true;
 
 fail:
-    for (uint32_t i = 0; i < exportedObjects; i++) {
-        if (exportedFds[i] >= 0) {
-            backendCloseFd(exportedFds[i], "direct_export_descriptor_fail");
-            exportedFds[i] = -1;
+    for (uint32_t i = 0; i < ARRAY_SIZE(desc->objects); i++) {
+        if (desc->objects[i].fd >= 0) {
+            backendCloseFd(desc->objects[i].fd, "direct_export_descriptor_fail");
+            desc->objects[i].fd = -1;
         }
     }
     desc->num_objects = 0;
