@@ -225,6 +225,8 @@ typedef struct _NVDriver
     int                     numFramesPresented;
     int                     profileCount;
     VAProfile               profiles[MAX_PROFILES];
+    int                     decodeProfileCount;
+    VAProfile               decodeProfiles[MAX_PROFILES];
     bool                    supportsEncodeH264;
     bool                    supportsEncodeH26410Bit;
     bool                    supportsEncodeH264444;

@@ -2068,6 +2068,16 @@ static bool isEncodeProfileSupportedByDriver(const NVDriver *drv, VAProfile prof
     return false;
 }
 
+static bool isDecodeProfileSupportedByDriver(const NVDriver *drv, VAProfile profile) {
+    for (int i = 0; i < drv->decodeProfileCount; i++) {
+        if (drv->decodeProfiles[i] == profile) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool isEncodeEntrypoint(VAEntrypoint entrypoint) {
     return entrypoint == VAEntrypointEncSlice;
 }
@@ -5364,6 +5374,12 @@ static VAStatus nvQueryConfigProfiles2(
     }
 #endif
 
+    // Preserve the profiles confirmed by NVDEC before adding profiles that
+    // may only be supported by NVENC. The public profile list is the union of
+    // both capabilities, while entrypoint queries must keep them distinct.
+    drv->decodeProfileCount = profiles;
+    memcpy(drv->decodeProfiles, profile_list, (size_t) profiles * sizeof(*profile_list));
+
     if (drv->supportsEncodeH264) {
         bool haveBaseline = false;
         bool haveMain = false;
@@ -5431,7 +5447,7 @@ static VAStatus nvQueryConfigProfiles2(
 
     //now filter out the codecs we don't support
     for (int i = 0; i < profiles; i++) {
-        bool supportedByDecode = vaToCuCodec(profile_list[i]) != cudaVideoCodec_NONE;
+        bool supportedByDecode = isDecodeProfileSupportedByDriver(drv, profile_list[i]);
         bool supportedByEncode = isEncodeProfileSupportedByDriver(drv, profile_list[i]);
         bool supportedByVpp = profile_list[i] == VAProfileNone;
         if (!supportedByDecode && !supportedByEncode && !supportedByVpp) {
@@ -5462,7 +5478,7 @@ static VAStatus nvQueryConfigEntrypoints(
     NVDriver *drv = (NVDriver*) ctx->pDriverData;
     int count = 0;
 
-    if (vaToCuCodec(profile) != cudaVideoCodec_NONE) {
+    if (isDecodeProfileSupportedByDriver(drv, profile)) {
         entrypoint_list[count++] = VAEntrypointVLD;
     }
 
@@ -5563,7 +5579,7 @@ static VAStatus nvGetConfigAttributes(
         return VA_STATUS_SUCCESS;
     }
 
-    if (entrypoint != VAEntrypointVLD || vaToCuCodec(profile) == cudaVideoCodec_NONE) {
+    if (entrypoint != VAEntrypointVLD || !isDecodeProfileSupportedByDriver(drv, profile)) {
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
 
@@ -5818,7 +5834,7 @@ static VAStatus nvCreateConfig(
     }
 
     cudaVideoCodec cudaCodec = vaToCuCodec(profile);
-    if (cudaCodec == cudaVideoCodec_NONE) {
+    if (cudaCodec == cudaVideoCodec_NONE || !isDecodeProfileSupportedByDriver(drv, profile)) {
         LOG("Profile not supported: %d", profile);
         return VA_STATUS_ERROR_UNSUPPORTED_PROFILE;
     }
